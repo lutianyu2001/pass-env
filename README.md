@@ -4,7 +4,8 @@
     <strong>English</strong> | <a href="./README/README_CN.md">中文</a>
 </p>
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)<br>
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Release](https://img.shields.io/github/v/release/lutianyu2001/pass-env)](https://github.com/lutianyu2001/pass-env/releases/latest)<br>
 [![CI](https://github.com/lutianyu2001/pass-env/actions/workflows/ci.yml/badge.svg)](https://github.com/lutianyu2001/pass-env/actions/workflows/ci.yml)
 
 A lightweight tool that gives each project the secrets its `.env.pass` names, decrypted from the [pass](https://www.passwordstore.org/) store when the shell enters the project and taken away when it leaves.

@@ -4,7 +4,8 @@
     <a href="../README.md">English</a> | <strong>中文</strong>
 </p>
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)<br>
+[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![Release](https://img.shields.io/github/v/release/lutianyu2001/pass-env)](https://github.com/lutianyu2001/pass-env/releases/latest)<br>
 [![CI](https://github.com/lutianyu2001/pass-env/actions/workflows/ci.yml/badge.svg)](https://github.com/lutianyu2001/pass-env/actions/workflows/ci.yml)
 
 一个轻量的工具：每个项目用 `.env.pass` 写明自己要哪些密钥，shell 进入项目时从 [pass](https://www.passwordstore.org/) 密码库解密加载，离开时撤掉。
