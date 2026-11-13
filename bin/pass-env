@@ -70,8 +70,12 @@ EOF
 }
 
 # say MESSAGE: to stderr, with anything that could drive the terminal (from a path, say) replaced by "?".
-say() { printf 'pass-env: %s\n' "$*" | LC_ALL=C tr -c ' -~\n' '?' >&2; }
+# Every message starts with "[pass-env] ", so that it is recognised among the output of other programs (a prompt, a
+# setup script, an agent's command). say: a warning or an error, on standard error; tell: what a command did, on
+# standard output.
+say() { printf '[pass-env] %s\n' "$*" | LC_ALL=C tr -c ' -~\n' '?' >&2; }
 die() { say "$*"; exit 1; }
+tell() { printf '[pass-env] %s\n' "$*"; }
 quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
 
 # The character sets are spelled out: a range like A-Z follows the locale's collation in some shells.
@@ -334,7 +338,7 @@ statements() {
                 k++
                 split(pair[i], ne, " "); n = ne[1]; e = ne[2]; v = value[k]
                 if (substr(v, 1, 1) != "1") {
-                    print "pass-env: " file ": " n ": cannot decrypt " e ", skipped" | "cat 1>&2"
+                    print "[pass-env] " file ": " n ": cannot decrypt " e ", skipped" | "cat 1>&2"
                     failed = 1
                     continue
                 }
@@ -600,13 +604,13 @@ cmd_init() {
         for sh in ${shells:-bash zsh fish}; do
             f=$(rc_file "$sh")
             if [ ! -f "$f" ] || ! grep -qxF "$init_begin" "$f"; then continue; fi
-            if [ "$dry" = 1 ]; then echo "would remove the pass-env block from $f"; continue; fi
+            if [ "$dry" = 1 ]; then tell "would remove the pass-env block from $f"; continue; fi
             rest=$(without_block "$f")
             # nothing left: the file was init's own, unless it is a link into the user's own files
             if [ -z "$(printf '%s' "$rest" | tr -d ' \t\n')" ] && { [ "$sh" = fish ] || [ ! -L "$f" ]; }; then
-                rm -f "$f"; echo "removed $f"
+                rm -f "$f"; tell "removed $f"
             else
-                printf '%s\n' "$rest" >"$f"; echo "removed the pass-env block from $f"
+                printf '%s\n' "$rest" >"$f"; tell "removed the pass-env block from $f"
             fi
         done
         return 0
@@ -637,20 +641,20 @@ cmd_init() {
             new=$block
             [ -z "$old" ] || new=$old$nl$nl$block
         fi
-        if [ -f "$f" ] && [ "$(cat "$f")" = "$new" ]; then echo "$f: already set up"; continue; fi
+        if [ -f "$f" ] && [ "$(cat "$f")" = "$new" ]; then tell "$f: already set up"; continue; fi
         if [ "$dry" = 1 ]; then
-            echo "would write the pass-env block into $f:"; printf '%s\n' "$block"; continue
+            tell "would write the pass-env block into $f:"; printf '%s\n' "$block"; continue
         fi
         mkdir -p "${f%/*}"
         printf '%s\n' "$new" >"$f"                # in place: a symbolic link stays one
-        echo "set up $sh in $f"; changed=1
+        tell "set up $sh in $f"; changed=1
         [ "$sh" != bash ] || bash_set=1
     done
     [ "$dry" = 0 ] && [ "$changed" = 1 ] || return 0
     [ -f "$store/.gpg-id" ] || say "init: no pass store at $store yet; make one with: pass init <GPG-KEY-ID>"
-    echo "Open a new shell to start using it."
+    tell "open a new shell to start using it"
     [ "$bash_set" = 1 ] || return 0
-    echo "For tools that run non-interactive bash (Claude Code, for one), set BASH_ENV to $dir/hook.bash"
+    tell "for tools that run non-interactive bash (Claude Code, for one), set BASH_ENV to $dir/hook.bash"
 }
 
 cmd_git_credential() {

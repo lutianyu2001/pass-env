@@ -138,6 +138,7 @@ contains "refuses TMOUT" "TMOUT may not be set" "$msgs"
 contains "refuses ANTHROPIC_API_KEY" "ANTHROPIC_API_KEY may not be set from a secret (it would make every Claude Code" "$msgs"
 contains "reports a line that is not a mapping" "not NAME=ENTRY (Z)" "$msgs"
 contains "reports a missing entry" "W: no entry k/nope" "$msgs"
+expect "every message starts with [pass-env]" "" "$(printf '%s\n' "$msgs" | grep -v '^\[pass-env\] ')"
 contains "reports an entry it cannot decrypt" "V: cannot decrypt k/broken" "$msgs"
 contains "reports a line naming a path outside the store" "not NAME=ENTRY (U)" "$msgs"
 lacks "prints no value" "$SPECIAL" "$msgs"
@@ -345,7 +346,7 @@ expect "init writes one block per startup file" "1 1 1" \
     "$(grep -c '^# >>> pass-env init >>>$' "$BRC") $(grep -c '^# >>> pass-env init >>>$' "$H/.zshenv") $(grep -c '^# >>> pass-env init >>>$' "$H/.config/fish/conf.d/pass-env.fish")"
 contains "init keeps what the file had" 'alias ll="ls -l"' "$(cat "$BRC")"
 before=$(cksum <"$BRC")
-contains "init a second time changes nothing" "already set up" "$(home "$P" init bash)"
+expect "init a second time changes nothing, and says so" "[pass-env] $BRC: already set up" "$(home "$P" init bash)"
 expect "a second init leaves the file as it was" "$before" "$(cksum <"$BRC")"
 # shellcheck disable=SC2086  # $BLOGIN is -l or nothing
 expect "after init, a new bash has the project's keys" "one" \
