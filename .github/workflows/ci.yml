@@ -1,0 +1,84 @@
+# CI: shellcheck, the tests on Linux (with mawk, gawk and BusyBox awk) and on macOS, each with bash, zsh and fish, and
+# the conda package as pixi global installs it. Runs on a push to main and on a pull request, and release.yml calls it
+# before a release. Every step runs what can be run by hand: tests/run.sh and packaging/conda/test-local.sh.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: shellcheck
+        run: |
+          shellcheck -s sh bin/pass-env install.sh tests/run.sh packaging/conda/test-local.sh
+          shellcheck -s bash share/pass-env/hook.bash
+
+  test-linux:
+    strategy:
+      fail-fast: false
+      matrix:
+        awk: [mawk, gawk, busybox]
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install zsh, fish and the awks
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends zsh fish gawk mawk busybox gnupg
+      - name: Tests
+        env:
+          AWK_IMPL: ${{ matrix.awk }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/awk"
+          case $AWK_IMPL in
+            busybox) printf '#!/bin/sh\nexec busybox awk "$@"\n' >"$RUNNER_TEMP/awk/awk"; chmod +x "$RUNNER_TEMP/awk/awk" ;;
+            *) ln -s "$(command -v "$AWK_IMPL")" "$RUNNER_TEMP/awk/awk" ;;
+          esac
+          PATH="$RUNNER_TEMP/awk:$PATH" ZSH=$(command -v zsh) FISH=$(command -v fish) tests/run.sh
+
+  test-macos:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install fish and GnuPG
+        run: brew install fish gnupg
+      - name: Tests
+        run: ZSH=/bin/zsh FISH=$(command -v fish) tests/run.sh
+
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: prefix-dev/setup-pixi@9936258fee697aff89b3fed6ca1f80a382ef694e # v0.11.3
+        with:
+          pixi-version: v0.79.0
+          run-install: false
+      - name: The conda package under pixi global
+        env:
+          RATTLER_BUILD: rattler-build==0.80.0
+        run: packaging/conda/test-local.sh

@@ -1,0 +1,678 @@
+#!/bin/sh
+# pass-env: gives a project the secrets its .env.pass names, taken from the pass store (https://www.passwordstore.org/).
+#
+# A project's .env.pass maps the variables the project reads to pass entries, one a line, and holds no value:
+#
+#     OPENAI_API_KEY=API_KEY/openai/default    # the name in this project = the entry in pass
+#
+# A variable gets the entry's first line, as `pass show -c` copies it. The file is read as data and never run, so a
+# cloned repository's .env.pass can at most hand that repository's code one of your own secrets. Names must be upper
+# case. Refused: names a shell, a loader or a common tool acts on (PATH, LD_*, BASH_*, PROMPT*, ZDOTDIR, TMOUT, UID,
+# JAVA_TOOL_OPTIONS, ...), and the ones Claude Code authenticates with (ANTHROPIC_API_KEY, ANTHROPIC_AUTH_TOKEN,
+# CLAUDE_CODE_OAUTH_*), which would make every `claude` started in the project bill that key. A name mapped twice keeps
+# its first line. A .env.pass that is not yours is ignored, and none is looked for in /.
+#
+# The commands are listed by `pass-env help` (usage below). `export` is what the shell hooks (share/pass-env/hook.bash,
+# hook.zsh and hook.fish) evaluate: the nearest .env.pass from $PWD upward applies, and only that one; leaving its tree
+# unsets the variables or sets back the values they had before. The hooks keep their state in _PASS_ENV_NAMES,
+# _PASS_ENV_STAMP (a hash of the mapping and of the entries' contents; "partial:<epoch>:<hash>" when an entry could not
+# be read, so that a check after a minute tries again) and _PASS_ENV_PREV_<NAME>.
+#
+# Entries are decrypted with gpg directly, eight at a time. The values travel through pipes and variables, never
+# through process arguments or files, and each comes back with its index and length: when the parallel output does not
+# add up (a value longer than the pipe writes at once), every entry is decrypted again one by one. With XDG_RUNTIME_DIR,
+# when it is yours, owner only and (on Linux) a tmpfs, values are cached there for 24 hours in pass-env/<stamp>, so an
+# edited entry is never answered from the cache. Without it (macOS) nothing is cached.
+#
+# POSIX sh and awk. The tools it calls (gpg, xargs -0 -P, sort, find -mmin, sha256sum or shasum) are those of Linux and
+# macOS. Problems go to stderr, prefixed "pass-env:"; values are printed only by `get` and into `export`'s statements.
+
+set -u
+
+# The version: `git archive` of a tag writes it here (export-subst in .gitattributes), install.sh writes it into the
+# copy it installs, and a checkout asks git (version_of below).
+# shellcheck disable=SC2016  # the placeholder is literal
+PASS_ENV_VERSION='$Format:%(describe:tags=true,match=v[0-9]*)$'
+store=${PASSWORD_STORE_DIR:-$HOME/.password-store}
+ttl_minutes=1440
+# After an entry could not be read, the next check tries again once this many seconds have passed.
+retry_seconds=${PASS_ENV_RETRY_SECONDS:-60}
+nl='
+'
+
+usage() {
+    cat <<'EOF'
+pass-env: gives a project the secrets its .env.pass names, from the pass store.
+
+  pass-env export [sh|fish]
+      Print the statements that bring this shell's environment up to date for the current directory, for a POSIX
+      shell (bash, zsh) or for fish. The shell hooks evaluate them; see `pass-env hook`.
+  pass-env run [-f FILE] [NAME=ENTRY ...] [--] COMMAND [ARG ...]
+      Run COMMAND with secrets in its environment: those NAME=ENTRY name and those FILE maps, or, with neither,
+      those of the nearest .env.pass. Nothing runs when a mapping cannot be satisfied.
+  pass-env get ENTRY
+      Print an entry's first line, for tools that run a command to get a credential.
+  pass-env status
+      Show which .env.pass applies here, what it maps, and what the shell has loaded. Prints no value.
+  pass-env hook bash|zsh|fish [--path]
+      Print the line that loads the hook, for ~/.bashrc, ~/.zshenv or ~/.config/fish/conf.d/pass-env.fish:
+          eval "$(pass-env hook zsh)"        pass-env hook fish | source
+      With --path, the hook file's path instead, for BASH_ENV.
+  pass-env init [bash] [zsh] [fish] [--dry-run]
+      Load the hooks from the shells' startup files (all three that are installed, or those named): a block
+      between "# >>> pass-env init >>>" and "# <<< pass-env init <<<". Checks that gpg and pass are installed.
+  pass-env init --undo [bash] [zsh] [fish] [--dry-run]
+      Remove those blocks.
+  pass-env git-credential ENTRY get
+      A git credential helper answering with ENTRY:   helper = !pass-env git-credential ENTRY
+  pass-env version | help
+EOF
+}
+
+# say MESSAGE: to stderr, with anything that could drive the terminal (from a path, say) replaced by "?".
+say() { printf 'pass-env: %s\n' "$*" | LC_ALL=C tr -c ' -~\n' '?' >&2; }
+die() { say "$*"; exit 1; }
+quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+
+# The character sets are spelled out: a range like A-Z follows the locale's collation in some shells.
+
+# valid_entry ENTRY: a pass entry name that stays inside the store.
+valid_entry() {
+    case $1 in
+        '' | [./]* | */../* | */.. | *[!ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_./@+-]*)
+            return 1 ;;
+    esac
+}
+
+# refused NAME: why NAME may not be set from a secret, or nothing (status 1) when it may.
+refused() {
+    case $1 in
+        ANTHROPIC_API_KEY | ANTHROPIC_AUTH_TOKEN | CLAUDE_CODE_OAUTH_*)
+            echo "it would make every Claude Code started here use this key; give it a name of the project's own"
+            return 0 ;;
+        '' | [0123456789]* | *[!ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_]*)
+            echo "names are upper case"
+            return 0 ;;
+        PATH | HOME | USER | LOGNAME | USERNAME | SHELL | IFS | ENV | CDPATH | GLOBIGNORE | PWD | OLDPWD | SHLVL | \
+        TMPDIR | TMPPREFIX | PROMPT_COMMAND | PROMPT* | RPROMPT* | RPS[0123456789] | PS[0123456789] | SPROMPT | \
+        BASH* | SHELLOPTS | POSIXLY_CORRECT | ZDOTDIR | ZSH* | FISH* | FPATH | MANPATH | MAIL | MAILPATH | MAILCHECK | \
+        MODULE_PATH | NULLCMD | READNULLCMD | TMOUT | PERIOD | HIST* | SAVEHIST | POSTEDIT | WORDCHARS | KEYTIMEOUT | \
+        STTY | COLUMNS | LINES | UID | EUID | GID | EGID | PPID | GROUPS | RANDOM | SRANDOM | SECONDS | EPOCH* | \
+        LINENO | OPTIND | OPTARG | OPTERR | FUNCNAME | HOSTNAME | HOSTTYPE | MACHTYPE | OSTYPE | ARGV0 | TTYIDLE | \
+        ERRNO | KEYBOARD_HACK | TRY_BLOCK_* | LISTMAX | LISTPROMPT | WATCH | WATCHFMT | LOGCHECK | DIRSTACKSIZE | \
+        TIMEFMT | TIMEFORMAT | REPORTTIME | REPORTMEMORY | CORRECT_IGNORE* | FCEDIT | INPUTRC | HOSTFILE | \
+        EXECIGNORE | FIGNORE | COMP* | READLINE_* | CHILD_MAX | IGNOREEOF | \
+        LD_* | DYLD_* | GNUPGHOME | GPG_* | PASSWORD_STORE_* | PASS_ENV_* | _PASS_ENV_* | PYTHON* | NODE_OPTIONS | \
+        PERL5* | RUBY* | JAVA_TOOL_OPTIONS | _JAVA_OPTIONS | JDK_JAVA_OPTIONS | GIT_* | SSH_* | TERM* | LANG | LC_* | \
+        XDG_* | EDITOR | VISUAL | PAGER | MANPAGER | MANOPT | LESS* | MAKEFLAGS | MFLAGS)
+            echo "a shell, a loader or a common tool acts on it"
+            return 0 ;;
+    esac
+    return 1
+}
+
+# mine PATH: whether PATH is the user's own. POSIX test has no -O, so the owner's uid is read from ls -n.
+mine() {
+    my_uid=${my_uid:-$(id -u)}
+    # shellcheck disable=SC2012  # only the fields before the name are read
+    ls -ldn -- "$1" 2>/dev/null | { read -r _mode _links owner _rest && [ "$owner" = "$my_uid" ]; }
+}
+
+# find_file: the nearest .env.pass of the user's own from $PWD upward, / excluded. One that is not the user's is
+# passed over silently (a warning would come at every prompt); `status` names it.
+find_file() {
+    d=$PWD
+    while [ -n "$d" ] && [ "$d" != / ]; do
+        if [ -f "$d/.env.pass" ] && mine "$d/.env.pass"; then printf '%s' "$d/.env.pass"; return 0; fi
+        d=${d%/*}
+    done
+    return 1
+}
+
+if command -v sha256sum >/dev/null 2>&1; then
+    sha() { sha256sum; }
+else
+    sha() { shasum -a 256; }
+fi
+
+# read_mapping SOURCE: NAME=ENTRY lines on stdin (an optional "export ", comments and blank lines allowed). Sets
+# $pairs to "NAME ENTRY" lines in order, and $skipped to how many lines were refused, each reported against SOURCE.
+read_mapping() {
+    src=$1 pairs='' skipped=0 seen=' '
+    mapping=$(LC_ALL=C awk '
+        { sub(/\r$/, "") }
+        /^[ \t]*(#.*)?$/ { next }
+        {
+            line = $0
+            sub(/^[ \t]*export[ \t]+/, "", line)
+            if (line ~ /^[ \t]*[A-Za-z_][A-Za-z0-9_]*[ \t]*=[ \t]*[A-Za-z0-9_@+-][A-Za-z0-9_.\/@+-]*[ \t]*(#.*)?$/) {
+                eq = index(line, "=")
+                name = substr(line, 1, eq - 1); entry = substr(line, eq + 1)
+                sub(/#.*/, "", entry)
+                gsub(/[ \t]/, "", name); gsub(/[ \t]/, "", entry)
+                print "OK " name " " entry
+            } else {
+                sub(/=.*/, "", line); gsub(/[ \t]/, "", line)
+                gsub(/[^!-~]/, "?", line)       # nothing that could drive the terminal reaches stderr
+                print "BAD " substr(line, 1, 60)
+            }
+        }')
+    while read -r tag n e; do
+        case $tag in
+            BAD) say "$src: skipped a line that is not NAME=ENTRY ($n)"; skipped=$((skipped + 1)); continue ;;
+            OK) ;;
+            *) continue ;;
+        esac
+        if why=$(refused "$n"); then
+            say "$src: $n may not be set from a secret ($why), skipped"; skipped=$((skipped + 1)); continue
+        fi
+        if ! valid_entry "$e"; then
+            say "$src: $n: $e is not an entry name inside the store, skipped"; skipped=$((skipped + 1)); continue
+        fi
+        case $seen in
+            *" $n "*) say "$src: $n is mapped more than once; the first line applies"; skipped=$((skipped + 1))
+                      continue ;;
+        esac
+        if [ ! -f "$store/$e.gpg" ]; then
+            say "$src: $n: no entry $e in $store, skipped"; skipped=$((skipped + 1)); continue
+        fi
+        pairs=$pairs$n' '$e$nl seen="$seen$n "
+    done <<EOF
+$mapping
+EOF
+}
+
+# stamp_of LABEL: a hash of LABEL, $pairs and the contents of the entries' files, which decides the values.
+stamp_of() {
+    s=$( {
+        printf '%s\n%s' "$1" "$pairs"
+        set --
+        rest=$pairs
+        while [ -n "$rest" ]; do
+            line=${rest%%"$nl"*}; rest=${rest#*"$nl"}
+            set -- "$@" "$store/${line#* }.gpg"
+        done
+        [ $# -eq 0 ] || cat "$@"
+    } 2>/dev/null | sha)
+    printf '%s' "${s%% *}"
+}
+
+# cache_dir: where values may be cached: $XDG_RUNTIME_DIR/pass-env, when that directory is the user's own, owner only,
+# and, where stat can tell (GNU), a tmpfs or ramfs. Status 1 when there is no such place.
+cache_dir() {
+    rt=${XDG_RUNTIME_DIR-}
+    [ -n "$rt" ] && [ -d "$rt" ] && mine "$rt" || return 1
+    case $(ls -ld "$rt" 2>/dev/null) in drwx------*) ;; *) return 1 ;; esac
+    fs=$(stat -f -c %T "$rt" 2>/dev/null) || return 1      # GNU stat; BSD's cannot tell, so no cache there
+    case $fs in tmpfs | ramfs) ;; *) return 1 ;; esac
+    printf '%s' "$rt/pass-env"
+}
+
+# decrypt_serial: one line per pair, "1<value>" or "0" where gpg failed, decrypting one entry at a time.
+decrypt_serial() {
+    rest=$pairs
+    while [ -n "$rest" ]; do
+        line=${rest%%"$nl"*}; rest=${rest#*"$nl"}
+        if v=$(gpg --batch --quiet --decrypt "$store/${line#* }.gpg" 2>/dev/null); then
+            printf '1%s\n' "${v%%"$nl"*}"
+        else
+            printf '0\n'
+        fi
+    done
+}
+
+# decrypt_parallel N: the same, eight at a time. Each decryption prints "<index><TAB>1<value><TAB><index>" or
+# "<index><TAB>0<TAB><index>" in one write; sorted back into order, the lines must be exactly N, the K-th starting and
+# ending with K, or the status is 1 (a long value's writes got mixed with another's) and nothing is printed.
+decrypt_parallel() {
+    rest=$pairs i=0
+    # shellcheck disable=SC2016  # $0 and $1 are the inner sh's arguments
+    while [ -n "$rest" ]; do
+        line=${rest%%"$nl"*}; rest=${rest#*"$nl"}
+        printf '%s\0%s\0' "$i" "$store/${line#* }.gpg"; i=$((i + 1))
+    done |
+        xargs -0 -n 2 -P 8 sh -c '
+            if v=$(gpg --batch --quiet --decrypt "$1" 2>/dev/null); then
+                printf "%s\t1%s\t%s\n" "$0" "${v%%"
+"*}" "$0"
+            else
+                printf "%s\t0\t%s\n" "$0" "$0"
+            fi' |
+        LC_ALL=C sort -n |
+        LC_ALL=C awk -v n="$1" '
+            BEGIN { k = 0 }
+            {
+                head = k "\t"; tail = "\t" k
+                if (substr($0, 1, length(head)) != head || length($0) < length(head) + length(tail) + 1 ||
+                    substr($0, length($0) - length(tail) + 1) != tail) { bad = 1; exit }
+                v[k] = substr($0, length(head) + 1, length($0) - length(head) - length(tail))
+                if (substr(v[k], 1, 1) != "1" && v[k] != "0") { bad = 1; exit }
+                k++
+            }
+            END {
+                if (bad || k != n) exit 1
+                for (i = 0; i < n; i++) print v[i]
+            }'
+}
+
+# values STAMP: one line per pair of $pairs, "1<value>" or "0" where gpg failed. Answered from the cache when it has
+# STAMP and is fresh; written to it when every entry was read.
+values() {
+    cache=''
+    if dir=$(cache_dir); then cache=$dir/$1; fi
+    if [ -n "$cache" ] && [ -f "$cache" ] && [ -n "$(find "$cache" -mmin -"$ttl_minutes" 2>/dev/null)" ]; then
+        cat "$cache"
+        return
+    fi
+    count=0 rest=$pairs
+    while [ -n "$rest" ]; do rest=${rest#*"$nl"}; count=$((count + 1)); done
+    out=$(decrypt_parallel "$count") || out=$(decrypt_serial)
+    if [ -n "$cache" ]; then
+        case $nl$out$nl in
+            *"${nl}0${nl}"*) ;;                                    # something failed: try again next time
+            *) (umask 077
+                mkdir -p "${cache%/*}"
+                find "${cache%/*}" -type f -mmin +"$ttl_minutes" -exec rm -f {} + 2>/dev/null
+                printf '%s\n' "$out" >"$cache.tmp.$$" && mv -f "$cache.tmp.$$" "$cache") ;;
+        esac
+    fi
+    printf '%s\n' "$out"
+}
+
+# statements LOAD SOURCE: the statements that undo the last load (when there was one) and, with LOAD=1, those that
+# load $pairs, whose values come on stdin as values() prints them; each name remembers the value it had before. In the
+# syntax of $syntax: sh (bash, zsh) or fish.
+statements() {
+    _PASS_ENV_ARG_PAIRS=$pairs _PASS_ENV_ARG_FILE=$2 _PASS_ENV_ARG_STAMP=${stamp-} _PASS_ENV_ARG_NOW=$(date +%s) \
+        LC_ALL=C awk -v want_load="$1" -v fish="$([ "$syntax" = fish ] && echo 1 || echo 0)" '
+        # q: s quoted for the shell, in single quotes. sh, bash and zsh: a quote inside is closed, escaped and
+        # reopened (split, not gsub, whose backslashes differ between awks). fish: backslash and quote get a backslash.
+        function q(s,    n, part, i, c, out) {
+            if (fish) {
+                out = ""
+                for (i = 1; i <= length(s); i++) {
+                    c = substr(s, i, 1)
+                    if (c == "\\" || c == "\047") out = out "\\"
+                    out = out c
+                }
+                return "\047" out "\047"
+            }
+            n = split(s, part, "\047"); out = part[1]
+            for (i = 2; i <= n; i++) out = out "\047\\\047\047" part[i]
+            return "\047" out "\047"
+        }
+        function setx(n, v) { return fish ? "set -gx " n " " q(v) : "export " n "=" q(v) }
+        function unset_(n) { return fish ? "set -e -g " n : "unset " n }
+        BEGIN {
+            pairs = ENVIRON["_PASS_ENV_ARG_PAIRS"]; file = ENVIRON["_PASS_ENV_ARG_FILE"]
+            stamp = ENVIRON["_PASS_ENV_ARG_STAMP"]; now = ENVIRON["_PASS_ENV_ARG_NOW"]
+            gsub(/[^ -~]/, "?", file)
+            if (ENVIRON["_PASS_ENV_STAMP"] != "") {
+                nold = split(ENVIRON["_PASS_ENV_NAMES"], old, " ")
+                for (i = 1; i <= nold; i++) {
+                    n = old[i]
+                    if (n !~ /^[A-Z_][A-Z0-9_]*$/) continue
+                    was[n] = 1
+                    p = "_PASS_ENV_PREV_" n
+                    if (p in ENVIRON) {
+                        print setx(n, ENVIRON[p]); print unset_(p)
+                        hasprev[n] = 1; prev[n] = ENVIRON[p]
+                    } else {
+                        print unset_(n)
+                    }
+                }
+                print unset_("_PASS_ENV_NAMES"); print unset_("_PASS_ENV_STAMP")
+            }
+            if (!want_load) exit
+        }
+        { value[NR] = $0 }
+        END {
+            if (!want_load) exit
+            np = split(pairs, pair, "\n"); k = 0; loaded = ""; failed = 0
+            for (i = 1; i <= np; i++) {
+                if (pair[i] == "") continue
+                k++
+                split(pair[i], ne, " "); n = ne[1]; e = ne[2]; v = value[k]
+                if (substr(v, 1, 1) != "1") {
+                    print "pass-env: " file ": " n ": cannot decrypt " e ", skipped" | "cat 1>&2"
+                    failed = 1
+                    continue
+                }
+                if (index(" " loaded " ", " " n " ")) continue
+                if (n in was) { if (n in hasprev) print setx("_PASS_ENV_PREV_" n, prev[n]) }
+                else if (n in ENVIRON) print setx("_PASS_ENV_PREV_" n, ENVIRON[n])
+                print setx(n, substr(v, 2))
+                loaded = loaded (loaded == "" ? "" : " ") n
+            }
+            # A partial stamp never equals a stamp: once retry_seconds have passed, the next check tries again.
+            print setx("_PASS_ENV_NAMES", loaded)
+            print setx("_PASS_ENV_STAMP", (failed ? "partial:" now ":" : "") stamp)
+        }'
+}
+
+cmd_export() {
+    syntax=${1:-sh}
+    case $syntax in sh | fish) ;; *) usage >&2; exit 2 ;; esac
+    [ $# -le 1 ] || { usage >&2; exit 2; }
+    pairs='' stamp=''
+    if ! file=$(find_file); then
+        [ -z "${_PASS_ENV_STAMP-}" ] || statements 0 '' </dev/null
+        return 0
+    fi
+    if [ ! -r "$file" ]; then
+        say "$file: cannot read it"
+        [ -z "${_PASS_ENV_STAMP-}" ] || statements 0 '' </dev/null
+        return 0
+    fi
+    # shellcheck disable=SC2094  # the first argument only labels the messages
+    read_mapping "$file" <"$file"
+    stamp=$(stamp_of "$file")
+    [ "$stamp" = "${_PASS_ENV_STAMP-}" ] && return 0
+    case ${_PASS_ENV_STAMP-} in
+        partial:*:"$stamp")                    # same mapping and entries, some unreadable: wait before trying again
+            since=${_PASS_ENV_STAMP#partial:}; since=${since%%:*}
+            [ $(($(date +%s) - since)) -ge "$retry_seconds" ] || return 0 ;;
+    esac
+    if [ -z "$pairs" ]; then
+        statements 1 "$file" </dev/null
+    else
+        values "$stamp" | statements 1 "$file"
+    fi
+}
+
+cmd_run() {
+    file='' inline=''
+    while [ $# -gt 0 ]; do
+        case $1 in
+            -f) [ $# -ge 2 ] || die "run: -f needs a file"; file=$2; shift 2 ;;
+            --) shift; break ;;
+            -*) die "run: unknown option $1" ;;
+            *=*) inline=$inline$1$nl; shift ;;
+            *) break ;;
+        esac
+    done
+    [ $# -gt 0 ] || { usage >&2; exit 2; }
+    text='' src=''
+    if [ -n "$file" ]; then
+        if [ ! -f "$file" ] || [ ! -r "$file" ]; then die "run: cannot read $file"; fi
+        text=$(cat "$file")$nl src=$file
+    fi
+    if [ -n "$inline" ]; then text=$text$inline src="${src:+$src and }the command line"; fi
+    if [ -z "$text" ]; then
+        file=$(find_file) || die "run: no .env.pass here or above it, and no NAME=ENTRY given"
+        [ -r "$file" ] || die "run: cannot read $file"
+        text=$(cat "$file") src=$file
+    fi
+    read_mapping "$src" <<EOF
+$text
+EOF
+    [ "$skipped" -eq 0 ] || die "run: $skipped mapping(s) could not be used, so nothing ran"
+    [ -n "$pairs" ] || die "run: $src maps nothing"
+    stamp=$(stamp_of "run")
+    vals=$(values "$stamp")
+    # Values stay in variables: a here-document could go through a temporary file.
+    rest=$pairs vrest=$vals$nl failed=0
+    while [ -n "$rest" ]; do
+        line=${rest%%"$nl"*}; rest=${rest#*"$nl"}
+        v=${vrest%%"$nl"*}; vrest=${vrest#*"$nl"}
+        case $v in
+            1*) export "${line%% *}=${v#1}" ;;
+            *) say "run: cannot decrypt ${line#* }"; failed=1 ;;
+        esac
+    done
+    unset vals vrest v
+    [ "$failed" -eq 0 ] || die "run: nothing ran"
+    exec "$@"
+}
+
+cmd_get() {
+    [ $# -eq 1 ] || { usage >&2; exit 2; }
+    valid_entry "$1" || die "get: not an entry name inside the store: $1"
+    [ -f "$store/$1.gpg" ] || die "get: no entry $1 in $store"
+    out=$(gpg --batch --quiet --decrypt "$store/$1.gpg") || die "get: cannot decrypt $1"
+    printf '%s' "${out%%"$nl"*}"
+}
+
+cmd_status() {
+    [ $# -eq 0 ] || { usage >&2; exit 2; }
+    echo "store: $store"
+    if file=$(find_file); then
+        echo "applies here: $file"
+        if [ -r "$file" ]; then
+            # shellcheck disable=SC2094  # the first argument only labels the messages
+            read_mapping "$file" <"$file"
+            rest=$pairs
+            while [ -n "$rest" ]; do
+                line=${rest%%"$nl"*}; rest=${rest#*"$nl"}
+                echo "  ${line%% *} = ${line#* }"
+            done
+            [ "$skipped" -eq 0 ] || echo "  ($skipped line(s) skipped, see above)"
+        else
+            echo "  (cannot read it)"
+        fi
+    else
+        echo "applies here: no .env.pass here or above it"
+    fi
+    d=$PWD
+    while [ -n "$d" ] && [ "$d" != / ]; do
+        if [ -f "$d/.env.pass" ] && ! mine "$d/.env.pass"; then echo "ignored, not yours: $d/.env.pass"; fi
+        d=${d%/*}
+    done
+    case ${_PASS_ENV_STAMP-} in partial:*) note=" (some entries could not be read; the next check tries again)" ;;
+        *) note='' ;; esac
+    echo "loaded in this shell: ${_PASS_ENV_NAMES:-nothing}$note"
+}
+
+# version_of: this program's version: the one written into it, or, in a git checkout, what `git describe` says, or
+# "unknown". No leading "v".
+version_of() {
+    v=$PASS_ENV_VERSION
+    # shellcheck disable=SC2016  # the placeholder is literal
+    case $v in
+        '$Format'*) v=$(git -C "$(self_dir)/.." describe --tags --match 'v[0-9]*' 2>/dev/null) || v=unknown ;;
+    esac
+    printf '%s' "${v#v}"
+}
+
+# The directory this program is in, through symbolic links.
+self_dir() {
+    p=$0
+    while [ -L "$p" ]; do
+        l=$(readlink "$p")
+        case $l in /*) p=$l ;; *) p=${p%/*}/$l ;; esac
+    done
+    case $p in */*) ;; *) p=./$p ;; esac
+    cd "${p%/*}" && pwd -P
+}
+
+# share_dir: the directory of this installation's hooks: share/pass-env next to bin/, or, when started through a
+# launcher that hides the program's path (pixi global), $CONDA_PREFIX/share/pass-env. Status 1 when there is none.
+share_dir() {
+    for d in "$(self_dir)/../share/pass-env" "${CONDA_PREFIX:+$CONDA_PREFIX/share/pass-env}"; do
+        if [ -n "$d" ] && [ -f "$d/hook.bash" ]; then (cd "$d" && pwd -P); return 0; fi
+    done
+    return 1
+}
+
+cmd_hook() {
+    [ $# -ge 1 ] || { usage >&2; exit 2; }
+    case $1 in bash | zsh | fish) ;; *) die "hook: bash, zsh or fish, not $1" ;; esac
+    dir=$(share_dir) || die "hook: no share/pass-env next to this program"
+    hook=$dir/hook.$1
+    case ${2-} in
+        --path) printf '%s\n' "$hook" ;;
+        '') if [ "$1" = fish ]; then printf 'source %s\n' "$(quote "$hook")"
+            else printf '. %s\n' "$(quote "$hook")"; fi ;;
+        *) die "hook: unknown option $2" ;;
+    esac
+}
+
+init_begin='# >>> pass-env init >>>'
+init_end='# <<< pass-env init <<<'
+
+# rc_file SHELL: the startup file `init` writes for SHELL. bash on macOS: ~/.bash_profile, since terminals there open
+# login shells, which do not read ~/.bashrc. zsh: ~/.zshenv, which every zsh reads, scripts and agents included. fish:
+# a file of its own in conf.d, which every fish reads.
+rc_file() {
+    case $1 in
+        bash) if [ "$(uname -s)" = Darwin ]; then echo "$HOME/.bash_profile"; else echo "$HOME/.bashrc"; fi ;;
+        zsh) echo "${ZDOTDIR:-$HOME}/.zshenv" ;;
+        fish) echo "${XDG_CONFIG_HOME:-$HOME/.config}/fish/conf.d/pass-env.fish" ;;
+    esac
+}
+
+# init_block SHELL HOOK: the block `init` writes, loading HOOK when it is there (so that a removed installation leaves
+# no error behind).
+init_block() {
+    printf '%s\n' "$init_begin" "# Written by 'pass-env init'; 'pass-env init --undo' removes this block."
+    if [ "$1" = fish ]; then
+        printf 'test -r %s; and source %s\n' "$(quote "$2")" "$(quote "$2")"
+    else
+        printf '[ -r %s ] && . %s\n' "$(quote "$2")" "$(quote "$2")"
+    fi
+    printf '%s\n' "$init_end"
+}
+
+# without_block FILE: FILE's contents without the block, and without the blank line init put before it. A begin line
+# with no end line after it before the next begin line is not a block: it and what follows stay.
+without_block() {
+    awk -v b="$init_begin" -v e="$init_end" '
+        $0 == b {
+            if (skip) { if (held) print last; held = 0; print b; for (i = 1; i <= n; i++) print kept[i] }
+            skip = 1; n = 0; next
+        }
+        skip { kept[++n] = $0; if ($0 == e) { skip = 0; held = 0 } ; next }
+        { if (held) print last; last = $0; held = 1; if ($0 != "") { print; held = 0 } }
+        END {
+            if (held) print last
+            if (skip) { print b; for (i = 1; i <= n; i++) print kept[i] }
+        }' "$1"
+}
+
+# with_block FILE BLOCK: FILE's contents with its first block replaced by BLOCK where it stands, and any later block
+# removed; status 1 when FILE has no block (a begin line followed by an end line).
+with_block() {
+    PASS_ENV_BLOCK=$2 awk -v b="$init_begin" -v e="$init_end" '
+        $0 == b {
+            if (skip) { print b; for (i = 1; i <= n; i++) print kept[i] }
+            skip = 1; n = 0; next
+        }
+        skip {
+            kept[++n] = $0
+            if ($0 == e) { skip = 0; if (!done) print ENVIRON["PASS_ENV_BLOCK"]; done = 1 }
+            next
+        }
+        { print }
+        END {
+            if (skip) { print b; for (i = 1; i <= n; i++) print kept[i] }
+            exit !done
+        }' "$1"
+}
+
+# install_hint MISSING...: the command that installs the missing tools on this system, as far as it can tell.
+install_hint() {
+    gpgpkg=gnupg
+    if command -v brew >/dev/null 2>&1; then cmd='brew install'
+    elif command -v pacman >/dev/null 2>&1; then cmd='sudo pacman -S'
+    elif command -v apt-get >/dev/null 2>&1; then cmd='sudo apt install'
+    elif command -v dnf >/dev/null 2>&1; then cmd='sudo dnf install'; gpgpkg=gnupg2
+    elif command -v zypper >/dev/null 2>&1; then cmd='sudo zypper install'; gpgpkg=gpg2
+    else
+        echo "install GnuPG (https://gnupg.org/) and pass (https://www.passwordstore.org/) with your package manager"
+        return
+    fi
+    pkgs=''
+    for m in "$@"; do case $m in gpg) pkgs="$pkgs $gpgpkg" ;; pass) pkgs="$pkgs pass" ;; esac; done
+    echo "$cmd$pkgs"
+}
+
+cmd_init() {
+    undo=0 dry=0 shells=''
+    for a in "$@"; do
+        case $a in
+            --undo) undo=1 ;;
+            --dry-run) dry=1 ;;
+            bash | zsh | fish) shells="$shells $a" ;;
+            *) usage >&2; exit 2 ;;
+        esac
+    done
+    if [ "$undo" = 1 ]; then
+        for sh in ${shells:-bash zsh fish}; do
+            f=$(rc_file "$sh")
+            if [ ! -f "$f" ] || ! grep -qxF "$init_begin" "$f"; then continue; fi
+            if [ "$dry" = 1 ]; then echo "would remove the pass-env block from $f"; continue; fi
+            rest=$(without_block "$f")
+            # nothing left: the file was init's own, unless it is a link into the user's own files
+            if [ -z "$(printf '%s' "$rest" | tr -d ' \t\n')" ] && { [ "$sh" = fish ] || [ ! -L "$f" ]; }; then
+                rm -f "$f"; echo "removed $f"
+            else
+                printf '%s\n' "$rest" >"$f"; echo "removed the pass-env block from $f"
+            fi
+        done
+        return 0
+    fi
+
+    missing=''
+    command -v gpg >/dev/null 2>&1 || missing="$missing gpg"
+    command -v pass >/dev/null 2>&1 || missing="$missing pass"
+    if [ -n "$missing" ]; then
+        say "init: not installed:$missing. Install them first, then run pass-env init again:"
+        # shellcheck disable=SC2086  # one argument per missing tool
+        say "init:   $(install_hint $missing)"
+        exit 1
+    fi
+    dir=$(share_dir) || die "init: no share/pass-env next to this program"
+    if [ -z "$shells" ]; then
+        for sh in bash zsh fish; do command -v "$sh" >/dev/null 2>&1 && shells="$shells $sh"; done
+    fi
+    [ -n "$shells" ] || die "init: none of bash, zsh and fish is installed"
+    changed=0 bash_set=0
+    for sh in $shells; do
+        f=$(rc_file "$sh")
+        block=$(init_block "$sh" "$dir/hook.$sh")
+        # a block that is there is replaced where it stands (the user may have moved it); otherwise one is appended
+        if ! { [ -f "$f" ] && new=$(with_block "$f" "$block"); }; then
+            old=''
+            [ -f "$f" ] && old=$(cat "$f")
+            new=$block
+            [ -z "$old" ] || new=$old$nl$nl$block
+        fi
+        if [ -f "$f" ] && [ "$(cat "$f")" = "$new" ]; then echo "$f: already set up"; continue; fi
+        if [ "$dry" = 1 ]; then
+            echo "would write the pass-env block into $f:"; printf '%s\n' "$block"; continue
+        fi
+        mkdir -p "${f%/*}"
+        printf '%s\n' "$new" >"$f"                # in place: a symbolic link stays one
+        echo "set up $sh in $f"; changed=1
+        [ "$sh" != bash ] || bash_set=1
+    done
+    [ "$dry" = 0 ] && [ "$changed" = 1 ] || return 0
+    [ -f "$store/.gpg-id" ] || say "init: no pass store at $store yet; make one with: pass init <GPG-KEY-ID>"
+    echo "Open a new shell to start using it."
+    [ "$bash_set" = 1 ] || return 0
+    echo "For tools that run non-interactive bash (Claude Code, for one), set BASH_ENV to $dir/hook.bash"
+}
+
+cmd_git_credential() {
+    [ $# -eq 2 ] || { usage >&2; exit 2; }
+    [ "$2" = get ] || exit 0           # store and erase: the value changes with `pass edit`
+    cat >/dev/null                     # git's request; the answer does not depend on it
+    value=$(cmd_get "$1") || exit 1
+    printf 'password=%s\n' "$value"
+}
+
+[ $# -gt 0 ] || { usage >&2; exit 2; }
+command=$1
+shift
+case $command in
+    export) cmd_export "$@" ;;
+    run) cmd_run "$@" ;;
+    get) cmd_get "$@" ;;
+    status) cmd_status "$@" ;;
+    hook) cmd_hook "$@" ;;
+    init) cmd_init "$@" ;;
+    git-credential) cmd_git_credential "$@" ;;
+    version | --version) echo "pass-env $(version_of)" ;;
+    help | -h | --help) usage ;;
+    *) usage >&2; exit 2 ;;
+esac

@@ -1,0 +1,36 @@
+# rattler-build recipe for pass-env, built from this checkout (source: path). Build it with
+#   pixi exec rattler-build build --recipe packaging/conda/recipe.yaml --output-dir <DIR>
+# A release's recipe takes the release archive as its source instead.
+context:
+  version: ${{ env.get("PASS_ENV_VERSION", default="0.1.0") }}
+
+package:
+  name: pass-env
+  version: ${{ version }}
+
+source:
+  path: ../..
+
+build:
+  number: 0
+  noarch: generic
+  script:
+    - PASS_ENV_VERSION=${{ version }} ./install.sh --prefix "$PREFIX"
+
+# gpg and pass are not dependencies: pass-env uses the system's, with the user's own keyring and gpg-agent.
+requirements:
+  run: []
+
+tests:
+  - script:
+      - test "$(pass-env version)" = "pass-env ${{ version }}"
+      - test -f "$PREFIX/share/pass-env/hook.bash"
+      - test -f "$PREFIX/share/pass-env/hook.zsh"
+      - test -f "$PREFIX/share/pass-env/hook.fish"
+
+about:
+  homepage: https://github.com/lutianyu2001/pass-env
+  repository: https://github.com/lutianyu2001/pass-env
+  license: Apache-2.0
+  license_file: LICENSE
+  summary: Gives each project the secrets its .env.pass names, from the pass store, through bash, zsh and fish hooks

@@ -1,0 +1,2 @@
+# git archive (and so a release's source archive) writes the version into bin/pass-env.
+bin/pass-env export-subst
