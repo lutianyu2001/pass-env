@@ -16,11 +16,34 @@ env:
   RATTLER_BUILD: rattler-build==0.80.0
 
 jobs:
+  # Whether the tag is a pre-release. A conda version cannot hold a "-", and the tag's version is the
+  # package's, so here a pre-release's tag is written without one: v1.2.0rc1, the label (a, b, rc,
+  # alpha, beta, pre, preview or dev) straight after the number, with or without a number of its
+  # own. The form other projects use (v1.2.0-rc.1) counts as a pre-release too, so that it never
+  # reaches the channel, and build then refuses it. A pre-release is built as a release is and gets a GitHub pre-release with its files,
+  # to download and try: it goes to no registry or package repository, and starts no other workflow.
+  kind:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    outputs:
+      prerelease: ${{ steps.kind.outputs.prerelease }}
+    steps:
+      - id: kind
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if printf '%s\n' "$TAG" | grep -Eq -- '(-|[0-9])(a|b|rc|alpha|beta|pre|preview|dev)\.?[0-9]*$'; then
+            echo "prerelease=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "prerelease=false" >> "$GITHUB_OUTPUT"
+          fi
+
   ci: # zizmor: ignore[self-repository] actionlint 1.7.12 rejects GitHub's $/ form
     uses: ./.github/workflows/ci.yml
 
   build:
-    needs: ci
+    needs: [kind, ci]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -44,6 +67,9 @@ jobs:
         env:
           TAG: ${{ github.ref_name }}
         run: |
+          case "$TAG" in
+            *-*) echo "::error::a conda version cannot hold a '-': tag a pre-release as v1.2.0rc1, not $TAG"; exit 1 ;;
+          esac
           PASS_ENV_VERSION=${TAG#v} pixi exec -s "$RATTLER_BUILD" rattler-build build \
             --recipe packaging/conda/recipe.yaml --output-dir "$RUNNER_TEMP/out"
           mkdir dist
@@ -55,7 +81,9 @@ jobs:
           if-no-files-found: error
 
   prefix-dev:
-    needs: build
+    needs: [kind, build]
+    # Not for a pre-release, nor the jobs that wait for this one.
+    if: needs.kind.outputs.prerelease != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     environment: prefix-dev
@@ -75,7 +103,9 @@ jobs:
         run: pixi exec -s "$RATTLER_BUILD" rattler-build upload prefix --channel "$CHANNEL" dist/pass-env-*.conda
 
   github-release:
-    needs: prefix-dev
+    needs: [kind, prefix-dev]
+    # Also when the jobs before it were skipped for a pre-release; never after one that failed.
+    if: ${{ !failure() && !cancelled() }}
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -89,8 +119,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
+          PRERELEASE: ${{ needs.kind.outputs.prerelease }}
           REPO: ${{ github.repository }}
-        run: gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TAG" --generate-notes dist/pass-env-*.conda
+        run: gh release create "$TAG" --repo "$REPO" --verify-tag --title "$TAG" --generate-notes --prerelease="$PRERELEASE" dist/pass-env-*.conda
 
   source-archive:
     needs: github-release
